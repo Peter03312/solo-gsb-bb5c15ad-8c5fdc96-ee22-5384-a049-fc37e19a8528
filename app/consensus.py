@@ -10,7 +10,11 @@ agglomerative clustering:
   hold two peaks of the same input spectrum, and when its endpoint span
   (highest minus lowest member m/z) does not exceed
   ``max(tolerance_da, endpoint_mean * tolerance_ppm / 1e6)``, the endpoint
-  mean being the average of the merged cluster's lowest and highest m/z;
+  mean being the average of the merged cluster's lowest and highest m/z.
+  The mean is formed as a sum of halves and the span is compared in
+  divided form, so the check stays finite for m/z values near the float
+  maximum: a plain ``(lo + hi) / 2 * tolerance_ppm`` overflows to an
+  infinite ppm tolerance there and would merge any pair;
 * every round merges the best legal pair, compared lexicographically by
   (merged span, merged lowest m/z, sorted member (spectrum, peak)
   indices), and repeats until no legal merge remains.
@@ -214,10 +218,18 @@ def build_consensus_spectrum(
         ordered.append((mz, len(members) - 1))
 
     # Any legal pair's span is bounded by ``window``: a legal span is at
-    # most max(tolerance_da, endpoint_mean * ppm/1e6) and the endpoint mean
-    # never exceeds the global maximum m/z.
+    # most max(tolerance_da, endpoint_mean * ppm_scale) and the endpoint
+    # mean never exceeds the global maximum m/z. The product itself can
+    # overflow to infinity for huge m/z and ppm tolerances; capping the
+    # window at the full data range keeps it finite without dropping a
+    # legal pair, whose endpoints are always data points.
+    ppm_scale = tolerance_ppm / 1e6
+    min_mz = singletons[0][0] if singletons else 0.0
     max_mz = singletons[-1][0] if singletons else 0.0
-    window = max(tolerance_da, max_mz * tolerance_ppm / 1e6)
+    window = max(tolerance_da, max_mz * ppm_scale)
+    data_range = max_mz - min_mz
+    if window > data_range:
+        window = data_range
 
     def evaluate(a: int, b: int):
         """Heap key for merging clusters ``a``/``b``, or None when illegal."""
@@ -226,12 +238,21 @@ def build_consensus_spectrum(
         merged_lo = lo[a] if lo[a] < lo[b] else lo[b]
         merged_hi = hi[a] if hi[a] > hi[b] else hi[b]
         span = merged_hi - merged_lo
-        limit = tolerance_da
-        ppm_limit = (merged_lo + merged_hi) / 2.0 * tolerance_ppm / 1e6
-        if ppm_limit > limit:
-            limit = ppm_limit
-        if span > limit:
-            return None
+        if span > tolerance_da:
+            # The Da bound failed, so the merge is legal only under the
+            # ppm bound: span <= endpoint_mean * ppm_scale. Both sides are
+            # evaluated in overflow-safe form — the mean as a sum of
+            # halves and the comparison divided by it — because the plain
+            # (lo + hi) / 2 * ppm overflows to an infinite tolerance near
+            # the float maximum and would merge any pair. For m/z >= 0 the
+            # span is at most twice the mean, so the ratio cannot
+            # overflow; a non-positive mean makes the ppm bound
+            # non-positive and can never authorise a positive span.
+            if ppm_scale <= 0.0:
+                return None
+            mean = merged_lo / 2.0 + merged_hi / 2.0
+            if mean <= 0.0 or span / mean > ppm_scale:
+                return None
         merged_members = tuple(sorted(members[a] + members[b]))
         first, second = (a, b) if a < b else (b, a)
         return (span, merged_lo, merged_members, first, second)
